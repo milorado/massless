@@ -300,7 +300,7 @@ async function currentUser(request, env) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Storage: R2 sites/<slug>/manifest.json and sites/<slug>/v<version>/<path>; D1 table `sites` (migrations/sites)
+// Storage: immutable R2 releases; D1 commits the manifest with its version. Legacy R2 manifests remain readable.
 // ---------------------------------------------------------------------------------------------
 
 const manifestKey = (slug) => `sites/${slug}/manifest.json`;
@@ -324,11 +324,12 @@ function manifestOf(row, files, size) {
   return {
     v: 1, slug: row.slug, owner: row.owner, version: row.version, size, generator: GENERATOR,
     createdAt: iso(row.created_at), updatedAt: iso(row.updated_at),
+    storageVersion: row.storageVersion,
     files: Object.fromEntries(files.map((f) => [f.path, { size: f.size, type: f.type, etag: f.etag }])),
   };
 }
 
-// In-isolate memos keep each page view to one R2 read: manifests for 15 s, blocks for 30 s.
+// Block flags are cached for 30 s. Release pointers are read from D1 so publishes are immediately visible.
 const memo = { manifest: new Map(), block: new Map() };
 export function _resetSiteCaches() { memo.manifest.clear(); memo.block.clear(); }
 async function cached(map, key, ttl, load) {
@@ -340,11 +341,12 @@ async function cached(map, key, ttl, load) {
   return value;
 }
 async function readManifest(env, slug) {
-  return cached(memo.manifest, slug, 15000, async () => {
-    const o = await env.SITES_BUCKET.get(manifestKey(slug));
-    if (!o) return null;
-    try { return JSON.parse(await o.text()); } catch { return null; }
-  });
+  const row = await db(env).prepare('SELECT manifest_json FROM sites WHERE slug = ?').bind(slug).first();
+  if (!row) return null;
+  if (row.manifest_json) return JSON.parse(row.manifest_json);
+  const o = await env.SITES_BUCKET.get(manifestKey(slug));
+  if (!o) return null;
+  try { return JSON.parse(await o.text()); } catch { return null; }
 }
 /** The takedown flag: KV `site-block:<slug>`. Any value blocks; "reports" means paused by visitor reports. */
 async function blockOf(env, slug) {
@@ -439,47 +441,40 @@ async function publish(request, env, ctx, user, slugFromPath) {
 
   const now = clock();
   const title = String(up.meta.title || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 120);
-  if (!slugFromPath) {
-    // claim the address and a seat under the 5-site limit in one statement: first come, first served
-    const claim = await db(env).prepare(
-      `INSERT INTO sites (slug, owner, version, bytes, files, title, created_at, updated_at)
-       SELECT ?, ?, 1, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM sites WHERE owner = ?) < ?
+  // Each upload owns its staging namespace, including requests racing for the same version.
+  const version = row ? row.version + 1 : 1;
+  const storageVersion = `${version}-${crypto.randomUUID()}`;
+  const next = { ...row, slug, owner: user.id, version, storageVersion, created_at: row ? row.created_at : now, updated_at: now, title: title || (row && row.title) || '', bytes: checked.size, files: checked.files.length };
+  const manifest = JSON.stringify(manifestOf(next, checked.files, checked.size));
+  try {
+    await writeVersion(env, slug, storageVersion, checked.files);
+  } catch (e) {
+    await deletePrefix(env.SITES_BUCKET, `sites/${slug}/v${storageVersion}/`).catch(() => {});
+    return json({ error: `The site could not be stored: ${e.message || e}` }, 500);
+  }
+  // A single D1 statement makes metadata and the release pointer visible together.
+  const moved = row
+    ? await db(env).prepare('UPDATE sites SET version = ?, bytes = ?, files = ?, title = ?, updated_at = ?, manifest_json = ? WHERE slug = ? AND owner = ? AND version = ? AND manifest_json IS ?')
+      .bind(version, checked.size, checked.files.length, next.title, now, manifest, slug, user.id, row.version, row.manifest_json).run()
+    : await db(env).prepare(
+      `INSERT INTO sites (slug, owner, version, bytes, files, title, created_at, updated_at, manifest_json)
+       SELECT ?, ?, 1, ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM sites WHERE owner = ?) < ?
        ON CONFLICT(slug) DO NOTHING`,
-    ).bind(slug, user.id, checked.size, checked.files.length, title, now, now, user.id, SITES_LIMITS.maxSites).run();
-    if (!claim.meta || !claim.meta.changes) {
-      const again = await db(env).prepare('SELECT owner FROM sites WHERE slug = ?').bind(slug).first();
-      if (again) return json({ error: 'That address is taken. Try another.', field: 'slug' }, 409);
-      return json({ error: `You can have up to ${SITES_LIMITS.maxSites} sites. Unpublish one to make room.` }, 403);
-    }
-    const fresh = { slug, owner: user.id, version: 1, created_at: now, updated_at: now };
-    try {
-      await writeVersion(env, slug, 1, checked.files);
-      await env.SITES_BUCKET.put(manifestKey(slug), JSON.stringify(manifestOf(fresh, checked.files, checked.size)), { httpMetadata: { contentType: 'application/json' } });
-    } catch (e) {
-      await deletePrefix(env.SITES_BUCKET, `sites/${slug}/`).catch(() => {});
-      await db(env).prepare('DELETE FROM sites WHERE slug = ? AND owner = ?').bind(slug, user.id).run();
-      return json({ error: `The site could not be stored: ${e.message || e}` }, 500);
-    }
-    memo.manifest.delete(slug);
-    if (ctx && ctx.waitUntil) ctx.waitUntil(sweepQuota(env).catch(() => {}));
-    return json({ ok: true, site: siteOut(env, { ...fresh, title, bytes: checked.size, files: checked.files.length }, null) }, 201);
-  }
-
-  // republish: write the new version beside the old one, switch the manifest, then delete the old files
-  const version = row.version + 1;
-  await writeVersion(env, slug, version, checked.files);
-  const moved = await db(env).prepare('UPDATE sites SET version = ?, bytes = ?, files = ?, title = ?, updated_at = ? WHERE slug = ? AND owner = ? AND version = ?')
-    .bind(version, checked.size, checked.files.length, title || row.title || '', now, slug, user.id, row.version).run();
+    ).bind(slug, user.id, checked.size, checked.files.length, next.title, now, now, manifest, user.id, SITES_LIMITS.maxSites).run();
   if (!moved.meta || !moved.meta.changes) {
-    await deletePrefix(env.SITES_BUCKET, `sites/${slug}/v${version}/`).catch(() => {});
-    return json({ error: 'This site changed while you were publishing. Try again.' }, 409);
+    await deletePrefix(env.SITES_BUCKET, `sites/${slug}/v${storageVersion}/`).catch(() => {});
+    if (row) return json({ error: 'This site changed while you were publishing. Try again.' }, 409);
+    const again = await db(env).prepare('SELECT owner FROM sites WHERE slug = ?').bind(slug).first();
+    if (again) return json({ error: 'That address is taken. Try another.', field: 'slug' }, 409);
+    return json({ error: `You can have up to ${SITES_LIMITS.maxSites} sites. Unpublish one to make room.` }, 403);
   }
-  const next = { ...row, version, updated_at: now, title: title || row.title || '', bytes: checked.size, files: checked.files.length };
-  await env.SITES_BUCKET.put(manifestKey(slug), JSON.stringify(manifestOf(next, checked.files, checked.size)), { httpMetadata: { contentType: 'application/json' } });
   memo.manifest.delete(slug);
-  const cleanup = deletePrefix(env.SITES_BUCKET, `sites/${slug}/v${row.version}/`).catch(() => {});
-  if (ctx && ctx.waitUntil) ctx.waitUntil(cleanup); else await cleanup;
-  return json({ ok: true, site: siteOut(env, next, await blockOf(env, slug)) });
+  if (row) {
+    const previous = row.manifest_json ? JSON.parse(row.manifest_json) : { version: row.version };
+    const cleanup = deletePrefix(env.SITES_BUCKET, `sites/${slug}/v${previous.storageVersion || previous.version}/`).catch(() => {});
+    if (ctx && ctx.waitUntil) ctx.waitUntil(cleanup); else await cleanup;
+  } else if (ctx && ctx.waitUntil) ctx.waitUntil(sweepQuota(env).catch(() => {}));
+  return json({ ok: true, site: siteOut(env, next, await blockOf(env, slug)) }, row ? 200 : 201);
 }
 
 async function unpublish(env, user, slug) {
@@ -707,7 +702,7 @@ async function notHere(request, env, manifest) {
   return ourPage(request, 404, 'Page not found', '<h1>Page not found</h1><p>This page is not on this site.</p><a class="btn" href="/">Go to the home page</a>');
 }
 
-async function sendFile(request, env, manifest, rel, status) {
+async function sendFile(request, env, manifest, rel, status, retry = true) {
   const info = manifest.files[rel];
   const ext = extOf(rel);
   const html = ext === 'html';
@@ -718,8 +713,13 @@ async function sendFile(request, env, manifest, rel, status) {
     etag,
   }), await siteCsp());
   if (status === 200 && (request.headers.get('if-none-match') || '').split(/\s*,\s*/).includes(etag)) return new Response(null, { status: 304, headers });
-  const obj = await env.SITES_BUCKET.get(fileKey(manifest.slug, manifest.version, rel));
+  const obj = await env.SITES_BUCKET.get(fileKey(manifest.slug, manifest.storageVersion || manifest.version, rel));
   if (!obj) {
+    if (retry) {
+      const current = await readManifest(env, manifest.slug);
+      if (current && current.files[rel] && current.storageVersion !== manifest.storageVersion)
+        return sendFile(request, env, current, rel, status, false);
+    }
     memo.manifest.delete(manifest.slug);
     return new Response('Not found', { status: 404, headers: baseHeaders(new Headers({ 'cache-control': 'no-store' }), PAGE_CSP) });
   }

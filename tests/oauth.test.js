@@ -21,17 +21,34 @@ function setup(hash, userOk = true) {
   return { store, replaced };
 }
 
-test("Google/GitHub return: tokens in the fragment become a session with the user, and the URL is tidied", async () => {
-  const { store, replaced } = setup("#access_token=AT&refresh_token=RT&expires_in=3600&token_type=bearer");
+test("a browser-initiated PKCE callback exchanges its code once and tidies the URL", async () => {
+  const { store, replaced } = setup("");
   const cloud = await import("../public/js/cloud.js?" + Math.random());
+  await cloud.signInWithProvider("github");
+  const authorize = new URL(location.href);
+  const flow = JSON.parse(store.get("massless.cloud-pkce"));
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(flow.verifier)));
+  const challenge = Buffer.from(digest).toString("base64url");
+  assert.equal(authorize.searchParams.get("code_challenge"), challenge);
+  assert.equal(authorize.searchParams.get("code_challenge_method"), "s256");
+  location.search = "?keep=1&code=one-time-code";
+  const base = globalThis.fetch;
+  let exchanges = 0;
+  globalThis.fetch = async (url, init) => {
+    if (url.endsWith("/auth/v1/token?grant_type=pkce")) {
+      exchanges++;
+      assert.deepEqual(JSON.parse(init.body), { auth_code: "one-time-code", code_verifier: flow.verifier });
+      return Response.json({ access_token: "AT", refresh_token: "RT", expires_in: 3600, user: { id: "u1", email: "a@b.c" } });
+    }
+    return base(url, init);
+  };
   assert.equal(await cloud.completeRedirect(), true);
-  const s = cloud.session();
-  assert.equal(s.access_token, "AT");
-  assert.equal(s.refresh_token, "RT");
-  assert.equal(s.user.email, "a@b.c");
-  assert.ok(s.expires_at > Date.now() / 1000);
-  assert.deepEqual(replaced, ["/projects/"]);
-  assert.ok(store.size === 1);
+  assert.equal(cloud.session().access_token, "AT");
+  assert.equal(cloud.session().user.email, "a@b.c");
+  assert.ok(cloud.session().expires_at > Date.now() / 1000);
+  assert.deepEqual(replaced, ["/projects/?keep=1"]);
+  await assert.rejects(cloud.completeRedirect(), /Start sign-in/);
+  assert.equal(exchanges, 1);
 });
 
 test("an error in the fragment is shown and nothing is stored", async () => {
@@ -51,7 +68,10 @@ test("sign-in goes to Supabase authorize with the provider and a return address"
   setup("");
   const cloud = await import("../public/js/cloud.js?" + Math.random());
   await cloud.signInWithProvider("github");
-  assert.equal(location.href, "https://x.supabase.co/auth/v1/authorize?provider=github&redirect_to=" + encodeURIComponent("https://chucksi.com/projects/"));
+  const target = new URL(location.href);
+  assert.equal(target.searchParams.get("provider"), "github");
+  assert.equal(target.searchParams.get("redirect_to"), "https://chucksi.com/projects/");
+  assert.match(target.searchParams.get("code_challenge"), /^[A-Za-z0-9_-]{43}$/);
   await assert.rejects(cloud.signInWithProvider("myspace"), /Unknown/);
 });
 
@@ -89,4 +109,77 @@ test("LinkedIn, X and Facebook are offered when switched on, and unknown provide
   await cloud.signInWithProvider("facebook");
   assert.match(location.href, /authorize\?provider=facebook&redirect_to=/);
   await assert.rejects(cloud.signInWithProvider("myspace"), /Unknown sign-in provider/);
+});
+
+test("unsolicited token fragments preserve an existing session", async () => {
+  const { store } = setup("#access_token=AT&refresh_token=RT");
+  const original = JSON.stringify({ access_token: "victim-token", user: { id: "victim" } });
+  store.set("massless.cloud-session", original);
+  const cloud = await import("../public/js/cloud.js?" + Math.random());
+  await assert.rejects(cloud.completeRedirect(), /Start sign-in|sign in/i);
+  assert.equal(store.get("massless.cloud-session"), original);
+});
+
+test("unsolicited, expired and wrong-path codes preserve the current session", async () => {
+  for (const pending of [null, { verifier: "v".repeat(43), createdAt: Date.now() - 3600001, path: "/projects/" }, { verifier: "v".repeat(43), createdAt: Date.now(), path: "/other/" }]) {
+    const { store } = setup("");
+    location.search = "?code=unsolicited";
+    const original = JSON.stringify({ user: { id: "victim" } });
+    store.set("massless.cloud-session", original);
+    if (pending) store.set("massless.cloud-pkce", JSON.stringify(pending));
+    const cloud = await import("../public/js/cloud.js?" + Math.random());
+    await assert.rejects(cloud.completeRedirect(), /Start sign-in/);
+    assert.equal(store.get("massless.cloud-session"), original);
+    assert.equal(store.has("massless.cloud-pkce"), false);
+  }
+});
+
+test("a failed code/verifier exchange cannot replace the existing session", async () => {
+  const { store } = setup("");
+  const original = JSON.stringify({ user: { id: "victim" } });
+  store.set("massless.cloud-session", original);
+  const cloud = await import("../public/js/cloud.js?" + Math.random());
+  await cloud.signInWithProvider("google");
+  location.search = "?code=attacker-code";
+  const base = globalThis.fetch;
+  globalThis.fetch = async (url, init) => url.endsWith("/auth/v1/token?grant_type=pkce")
+    ? Response.json({ error_description: "Invalid code verifier" }, { status: 400 }) : base(url, init);
+  await assert.rejects(cloud.completeRedirect(), /Invalid code verifier/);
+  assert.equal(store.get("massless.cloud-session"), original);
+  await assert.rejects(cloud.completeRedirect(), /Start sign-in/);
+});
+
+test("sign-up confirmation uses the same browser-bound code exchange", async () => {
+  const { store } = setup("");
+  const cloud = await import("../public/js/cloud.js?" + Math.random());
+  const base = globalThis.fetch;
+  let signup;
+  globalThis.fetch = async (url, init) => {
+    if (url.includes("/auth/v1/signup?")) {
+      signup = JSON.parse(init.body);
+      return Response.json({ user: { id: "new-user" } });
+    }
+    if (url.endsWith("/auth/v1/token?grant_type=pkce")) {
+      const flow = JSON.parse(store.get("test-flow"));
+      assert.equal(JSON.parse(init.body).code_verifier, flow.verifier);
+      return Response.json({ access_token: "AT", refresh_token: "RT", expires_in: 3600, user: { id: "new-user" } });
+    }
+    return base(url, init);
+  };
+  await cloud.signUp("new@example.test", "password");
+  const flow = store.get("massless.cloud-pkce");
+  const challenge = Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.parse(flow).verifier))).toString("base64url");
+  assert.equal(signup.code_challenge, challenge);
+  assert.equal(signup.code_challenge_method, "s256");
+  store.set("test-flow", flow);
+  location.search = "?code=email-code";
+  assert.equal(await cloud.completeRedirect(), true);
+  assert.equal(cloud.session().user.id, "new-user");
+});
+
+test("external callback addresses are refused before saving a verifier", async () => {
+  const { store } = setup("");
+  const cloud = await import("../public/js/cloud.js?" + Math.random());
+  await assert.rejects(cloud.signInWithProvider("github", "//other.example/projects/"), /on this site/);
+  assert.equal(store.size, 0);
 });

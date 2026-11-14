@@ -8,6 +8,8 @@ chucksi.com (`src/sites.js`, routed from `src/index.js`) takes the upload, check
 1. R2 bucket: `npx wrangler r2 bucket create chucksi-sites` (binding `SITES_BUCKET`, already in `wrangler.jsonc`).
 2. D1 tables, in the existing Sign database (the code uses `SITES_DB` when bound, else `SIGN_DB`):
    `npx wrangler d1 execute massless-sign --remote --file migrations/sites/0001_init.sql`
+   followed by `npx wrangler d1 execute massless-sign --remote --file migrations/sites/0002_manifest.sql` before running this Worker version.
+   The second migration adds the release manifest committed atomically with the site version. Existing R2 manifests remain readable until the next publish. New releases require the updated reader.
 3. Worker routes on zone `v2web.site`: `v2web.site/*` and `*.v2web.site/*` → Worker `massless`.
    DNS: proxied `v2web.site`, `www` and `*` records (already there). The Microsoft 365 records stay as they are;
    their names (`autodiscover`, `sip`, `lyncdiscover`, `enterpriseregistration`, ...) are reserved and never handed out.

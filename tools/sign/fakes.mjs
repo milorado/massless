@@ -2,7 +2,7 @@
 // FakeD1 runs office/sign_schema.sql on an in-memory SQLite (node:sqlite), so the real SQL is exercised.
 // FakeR2 keeps objects in a Map. Neither touches the disk.
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -39,7 +39,9 @@ class Stmt {
 export class FakeD1 {
   constructor(schemaPath = join(HERE, '..', '..', 'migrations', 'sign', '0001_init.sql')) {
     this.sqlite = new DatabaseSync(':memory:');
-    this.sqlite.exec(readFileSync(schemaPath, 'utf8'));
+    for (const migration of readdirSync(dirname(schemaPath)).filter((name) => /^\d+.*\.sql$/.test(name)).sort()) {
+      this.sqlite.exec(readFileSync(join(dirname(schemaPath), migration), 'utf8'));
+    }
   }
   prepare(sql) { return new Stmt(this, sql); }
   async batch(stmts) {

@@ -168,6 +168,8 @@ The contract library is CC0 JSON in `public/office/contracts/` (regenerate with 
 
 Setup: an R2 bucket (`SIGN_BUCKET`), a D1 database (`SIGN_DB`, schema in `migrations/sign/`) and a `SIGN_KEY` secret (`node tools/sign/keygen.mjs`). See `wrangler.jsonc`.
 
+Apply Sign migrations through `0002_payload_key.sql` before running this Worker version. Existing signatures keep their legacy R2 keys; new signatures use immutable payload keys selected by D1. Updated readers are required for those new records. Social sign-in and new email confirmations use PKCE and must finish in the browser that started them. Older email confirmations can be followed by signing in with email and password.
+
 ## Tests
 
 ```bash

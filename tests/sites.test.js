@@ -209,12 +209,12 @@ test('API: sign-in, publish, owner checks, update, list, limits, unpublish', asy
   assert.equal(pub.status, 201, pub.text);
   assert.equal(pub.data.site.url, 'https://cedar-lawn.v2web.site');
   assert.equal(pub.data.site.version, 1);
-  const manifest = JSON.parse(await (await env.SITES_BUCKET.get('sites/cedar-lawn/manifest.json')).text());
+  const manifest = JSON.parse(await env.SITES_DB.prepare('SELECT manifest_json FROM sites WHERE slug = ?').bind('cedar-lawn').first('manifest_json'));
   assert.equal(manifest.owner, 'alice-uuid');
   assert.equal(manifest.version, 1);
   assert.ok(manifest.createdAt && manifest.updatedAt && manifest.size > 1000);
   assert.ok(manifest.files['index.html'] && manifest.files['about/index.html'] && manifest.files['assets/img/photo.jpg']);
-  assert.ok(await env.SITES_BUCKET.get('sites/cedar-lawn/v1/index.html'));
+  assert.ok(await env.SITES_BUCKET.get(`sites/cedar-lawn/v${manifest.storageVersion}/index.html`));
 
   // Knowing a published slug never grants permission to overwrite or remove it.
   for (const [token, status] of [[undefined, 401], ['tok-nobody', 401], ['tok-new', 403]]) {
@@ -223,7 +223,7 @@ test('API: sign-in, publish, owner checks, update, list, limits, unpublish', asy
       assert.equal(response.status, status, `${method} rejects ${token || 'guest'}`);
     }
   }
-  assert.equal(JSON.parse(await (await env.SITES_BUCKET.get('sites/cedar-lawn/manifest.json')).text()).version, 1, 'rejected requests do not change the live site');
+  assert.equal(JSON.parse(await env.SITES_DB.prepare('SELECT manifest_json FROM sites WHERE slug = ?').bind('cedar-lawn').first('manifest_json')).version, 1, 'rejected requests do not change the live site');
 
   assert.equal((await call(env, 'GET', '/api/sites/check?slug=cedar-lawn')).data.taken, true);
   const again = await call(env, 'POST', '/api/sites', { token: 'tok-alice', form: uploadForm('cedar-lawn', files) });
@@ -255,9 +255,10 @@ test('API: sign-in, publish, owner checks, update, list, limits, unpublish', asy
   const up = await call(env, 'PUT', '/api/sites/cedar-lawn', { token: 'tok-alice', form: uploadForm('cedar-lawn', edited) });
   assert.equal(up.status, 200, up.text);
   assert.equal(up.data.site.version, 2);
-  assert.ok(!(await env.SITES_BUCKET.get('sites/cedar-lawn/v1/index.html')), 'old version deleted');
-  assert.match(await (await env.SITES_BUCKET.get('sites/cedar-lawn/v2/index.html')).text(), /<title>v2 /);
-  assert.ok(!JSON.parse(await (await env.SITES_BUCKET.get('sites/cedar-lawn/manifest.json')).text()).files['og.jpg']);
+  assert.ok(!(await env.SITES_BUCKET.get(`sites/cedar-lawn/v${manifest.storageVersion}/index.html`)), 'old version deleted');
+  const updated = JSON.parse(await env.SITES_DB.prepare('SELECT manifest_json FROM sites WHERE slug = ?').bind('cedar-lawn').first('manifest_json'));
+  assert.match(await (await env.SITES_BUCKET.get(`sites/cedar-lawn/v${updated.storageVersion}/index.html`)).text(), /<title>v2 /);
+  assert.ok(!JSON.parse(await env.SITES_DB.prepare('SELECT manifest_json FROM sites WHERE slug = ?').bind('cedar-lawn').first('manifest_json')).files['og.jpg']);
 
   const list = await call(env, 'GET', '/api/sites', { token: 'tok-alice' });
   assert.equal(list.status, 200);
