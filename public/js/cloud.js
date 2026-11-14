@@ -2,6 +2,18 @@
 let configPromise;
 let refreshPromise;
 const SESSION_KEY = "massless.cloud-session";
+const FLOW_KEY = "massless.cloud-pkce";
+const FLOW_MS = 60 * 60 * 1000;
+const base64url = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+async function beginFlow(returnPath) {
+  const target = new URL(returnPath, location.origin);
+  if (target.origin !== location.origin) throw new Error("Choose a return address on this site.");
+  const verifier = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const challenge = base64url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))));
+  // Same-browser storage also allows email confirmation in a new tab.
+  localStorage.setItem(FLOW_KEY, JSON.stringify({ verifier, createdAt: Date.now(), path: target.pathname }));
+  return { challenge, redirect: target.href };
+}
 export const cloudConfig = () =>
   (configPromise ||= fetch("/api/config")
     .then((r) => (r.ok ? r.json() : { cloud: false, models: {} }))
@@ -45,13 +57,16 @@ export async function signIn(email, password) {
   return s;
 }
 export async function signUp(email, password) {
-  // the confirmation email links back to this site's Projects page
-  const j = await auth(`signup?redirect_to=${encodeURIComponent(location.origin + "/projects/")}`, { email, password });
-  if (j.access_token)
+  // Confirmation codes can only be exchanged by the browser that started sign-up.
+  const flow = await beginFlow("/projects/");
+  const j = await auth(`signup?redirect_to=${encodeURIComponent(flow.redirect)}`, { email, password, code_challenge: flow.challenge, code_challenge_method: "s256" });
+  if (j.access_token) {
+    localStorage.removeItem(FLOW_KEY);
     saveSession({
       ...j,
       expires_at: Math.floor(Date.now() / 1000) + j.expires_in,
     });
+  }
   return j;
 }
 /** Social sign-ins the site offers, by Supabase provider name. */
@@ -68,42 +83,45 @@ export async function enabledProviders() {
     return [];
   }
 }
-/** Start a social sign-in (Google, GitHub, LinkedIn, X or Facebook); Supabase sends the visitor back to returnPath with tokens in the URL fragment. */
+/** Start a browser-bound Supabase PKCE sign-in. */
 export async function signInWithProvider(provider, returnPath = "/projects/") {
   if (!PROVIDERS.includes(provider)) throw new Error("Unknown sign-in provider.");
   const c = await cloudConfig();
   if (!c.cloud) throw new Error("Sign-in is not available right now. Try again later.");
+  const flow = await beginFlow(returnPath);
   location.href =
     c.supabaseUrl + "/auth/v1/authorize?provider=" + provider +
-    "&redirect_to=" + encodeURIComponent(location.origin + returnPath);
+    "&redirect_to=" + encodeURIComponent(flow.redirect) +
+    "&code_challenge=" + flow.challenge + "&code_challenge_method=s256";
 }
-/** Finish a Google/GitHub sign-in or an email confirmation link: read the fragment, store the session, tidy the URL. */
+/** Exchange a one-time code using this browser's verifier, leaving existing sessions intact on failure. */
 export async function completeRedirect() {
-  if (!location.hash || location.hash.length < 2) return false;
-  const p = new URLSearchParams(location.hash.slice(1));
-  const tidy = () => history.replaceState(null, "", location.pathname + location.search);
-  if (p.get("error") || p.get("error_description")) {
-    tidy();
-    throw new Error((p.get("error_description") || p.get("error")).replace(/\+/g, " "));
+  const query = new URLSearchParams(location.search);
+  const fragment = new URLSearchParams((location.hash || "").slice(1));
+  const code = query.get("code");
+  const error = query.get("error_description") || query.get("error") || fragment.get("error_description") || fragment.get("error");
+  if (!code && !error && !fragment.has("access_token") && !fragment.has("refresh_token")) return false;
+  query.delete("code");
+  query.delete("error");
+  query.delete("error_description");
+  const search = query.toString();
+  history.replaceState(null, "", location.pathname + (search ? "?" + search : ""));
+  if (error) {
+    localStorage.removeItem(FLOW_KEY);
+    throw new Error(error.replace(/\+/g, " "));
   }
-  const access_token = p.get("access_token");
-  if (!access_token) return false;
-  tidy();
-  const c = await cloudConfig();
-  const r = await fetch(c.supabaseUrl + "/auth/v1/user", {
-    headers: { apikey: c.publishableKey, Authorization: "Bearer " + access_token },
-  });
-  if (!r.ok) throw new Error("Sign-in could not be confirmed. Try again.");
-  const user = await r.json();
-  const expires_in = Number(p.get("expires_in")) || 3600;
-  saveSession({
-    access_token,
-    refresh_token: p.get("refresh_token"),
-    token_type: p.get("token_type") || "bearer",
-    expires_in,
-    expires_at: Number(p.get("expires_at")) || Math.floor(Date.now() / 1000) + expires_in,
-    user,
-  });
+  if (fragment.has("access_token") || fragment.has("refresh_token"))
+    throw new Error("Start sign-in from this browser. After confirming an older email link, sign in with your email and password.");
+  let flow;
+  try { flow = JSON.parse(localStorage.getItem(FLOW_KEY) || "null"); } catch { /* invalid pending flow */ }
+  localStorage.removeItem(FLOW_KEY);
+  if (!flow || !/^[A-Za-z0-9_-]{43}$/.test(flow.verifier) || flow.path !== location.pathname ||
+      !Number.isFinite(flow.createdAt) || Date.now() - flow.createdAt > FLOW_MS || flow.createdAt > Date.now())
+    throw new Error("Start sign-in from this browser, then open the confirmation here. You can also sign in with your email and password.");
+  const next = await auth("token?grant_type=pkce", { auth_code: code, code_verifier: flow.verifier });
+  if (!next.access_token || !next.refresh_token || !next.user?.id)
+    throw new Error("Sign-in could not be confirmed. Try again.");
+  saveSession({ ...next, expires_at: Math.floor(Date.now() / 1000) + next.expires_in });
   return true;
 }
 export async function accessToken() {

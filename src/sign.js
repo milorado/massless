@@ -292,7 +292,7 @@ async function getEnvelope(request, env, id) {
     out.payloads = [];
     for (const s of signers) {
       if (s.status !== 'signed') continue;
-      const p = await env.SIGN_BUCKET.get(blobKey(id, `s${s.idx}`));
+      const p = await env.SIGN_BUCKET.get(s.payload_key || blobKey(id, `s${s.idx}`));
       if (p) out.payloads.push({ index: s.idx, data: b64u(new Uint8Array(await p.arrayBuffer())) });
     }
   }
@@ -391,10 +391,17 @@ async function postEvent(request, env, id) {
     const fields = Math.max(0, Math.min(10000, Math.floor(Number(body.fields) || 0)));
     const valuesHash = HASH_RE.test(String(body.valuesHash || '')) ? body.valuesHash : null;
     const inPerson = body.inPerson === true;
-    await env.SIGN_BUCKET.put(blobKey(id, `s${who.index}`), bytes, { httpMetadata: { contentType: 'application/octet-stream' } });
-    const ch = await env.SIGN_DB.prepare("UPDATE sign_signers SET status = 'signed', signed_at = ?, payload_bytes = ? WHERE envelope_id = ? AND idx = ? AND status = 'pending' AND consented_at IS NOT NULL").bind(now, bytes.length, id, who.index).run();
-    if (!ch.meta || ch.meta.changes !== 1) return json({ error: 'You have already signed this envelope.' }, 409);
-    await env.SIGN_DB.prepare('UPDATE sign_envelopes SET bytes = bytes + ? WHERE id = ?').bind(bytes.length, id).run();
+    // Stage each request separately. Only the successful state transition publishes its key.
+    const payloadKey = blobKey(id, `s${who.index}/${crypto.randomUUID()}`);
+    await env.SIGN_BUCKET.put(payloadKey, bytes, { httpMetadata: { contentType: 'application/octet-stream' } });
+    const [ch] = await env.SIGN_DB.batch([
+      env.SIGN_DB.prepare("UPDATE sign_signers SET status = 'signed', signed_at = ?, payload_bytes = ?, payload_key = ? WHERE envelope_id = ? AND idx = ? AND status = 'pending' AND consented_at IS NOT NULL").bind(now, bytes.length, payloadKey, id, who.index),
+      env.SIGN_DB.prepare('UPDATE sign_envelopes SET bytes = bytes + ? WHERE id = ? AND EXISTS (SELECT 1 FROM sign_signers WHERE envelope_id = ? AND idx = ? AND payload_key = ?)').bind(bytes.length, id, id, who.index, payloadKey),
+    ]);
+    if (!ch.meta || ch.meta.changes !== 1) {
+      await env.SIGN_BUCKET.delete(payloadKey).catch(() => {});
+      return json({ error: 'You have already signed this envelope.' }, 409);
+    }
     const seq = await addEvent(env, id, { type, actor, signer: who.index, at: now, docHash, detail: { fields, valuesHash, inPerson } }, request);
     const left = await env.SIGN_DB.prepare("SELECT COUNT(*) AS n FROM sign_signers WHERE envelope_id = ? AND status != 'signed'").bind(id).first('n');
     let status = 'sent';
